@@ -1,5 +1,6 @@
 # Standard library imports
-from typing import TypedDict, NotRequired
+from typing import TypedDict, NotRequired, Literal
+import json
 
 # Langchain imports
 from langchain_core.messages import (
@@ -14,10 +15,11 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
 
 # LangGraph specific imports
-from langgraph.graph import START, END, StateGraph
+from langgraph.graph import START, END, StateGraph, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph.message import add_messages
-
+from langgraph.types import interrupt
+from langgraph.checkpoint.memory import MemorySaver
 
 class FrenchJournalState(TypedDict):
     """State for the French Journal Assistant.
@@ -27,7 +29,7 @@ class FrenchJournalState(TypedDict):
         check_continue: Flag to control conversation flow
     """
     messages: list[BaseMessage]
-    check_continue: NotRequired[bool]
+    completed: NotRequired[bool]
 
 
 @tool
@@ -45,8 +47,9 @@ def translate_from_english_to_french(text: str) -> str:
     )
 
     chain = prompt | translator | StrOutputParser()
+    result = chain.invoke({"text": text})
     
-    return chain.invoke({"text": text})
+    return f"Translation: {result}"
 
 @tool
 def correct_grammar(text: str) -> str:
@@ -129,79 +132,88 @@ Your goal is to help the user express themselves clearly and creatively in Frenc
 
 Try to always respond in French. Use English only when the user requires more guidance for French."""
 
-def should_continue(state: FrenchJournalState) -> FrenchJournalState:
-    """Ask user if they want to continue journaling."""
-     # Get the last message from the user if it exists
-    messages = state["messages"]
+WELCOME_MSG = "Bienvenue dans l'Assistant de Journal en Français! Tapez `q` pour quitter. Quelle note de journal aimeriez-vous écrire aujourd'hui? Vous pouvez écrire en anglais ou en français."
 
-    if messages and isinstance(messages[-1], HumanMessage):
-        last_message = messages[-1].content.lower().strip()
-        wants_to_continue = not (last_message in ["non", "no", "stop", "quit", "exit"])
-    else:
-        question = AIMessage(content="Voulez-vous continuer? (oui/non): ")
-        messages.append(question)
-        wants_to_continue = True
+def chatbot_with_tools_node(state: FrenchJournalState) -> FrenchJournalState:
+    """Chatbot that can call tools."""
+    defaults = {"messages": [], "completed": False}
 
-    return {
-        "messages": messages,  # Preserve existing messages
-        "check_continue": wants_to_continue
-    }
+    if not state["messages"]:
+        return defaults | state | {"messages": [AIMessage(content=WELCOME_MSG)]}
 
-def assistant(state: FrenchJournalState) -> FrenchJournalState:
-    """Process messages and decide on next action."""
-    print("Current state:", state)  # Debug print
-    # Create a clean list of messages for the LLM
-    messages = []
-    
-    # Add system message
-    messages.append(SystemMessage(content=SYSTEM_PROMPT))
-    
-    # Add conversation history
-    for msg in state["messages"]:
-        if isinstance(msg, dict):
-            # Convert dict to appropriate message type
-            if msg["type"] == "human":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["type"] == "ai":
-                messages.append(AIMessage(content=msg["content"]))
-        else:
-            # Message is already a Message object
-            messages.append(msg)
-    
-    # Get response from LLM
+    # Get the last message
+    last_msg = state["messages"][-1]
+
+    # Process only the last message if needed
+    if isinstance(last_msg, tuple) and last_msg[0] == "user":
+        state["messages"][-1] = HumanMessage(content=last_msg[1])
+
+    # Create message list with system prompt and history
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        *state["messages"]
+    ]
+
     response = llm_with_tools.invoke(messages)
-    print("LLM Response:", response)  # Debug print
-    
-    return {
-        "messages": state["messages"] + [response],
-        "check_continue": state.get("check_continue", True)
-    }
 
-def continue_condition(state: FrenchJournalState) -> bool:
+    # Set up some defaults if not already set, then pass through the provided state,
+    # overriding only the "messages" field.
+    return defaults | state | {"messages": state["messages"] + [response]}
+
+def human_node(state: FrenchJournalState) -> FrenchJournalState:
+    """Writes in French or in English."""
+    last_msg = state["messages"][-1]
+
+    user_input = interrupt(value="Ready for user input.")
+
+    if user_input in {"q", "quit", "exit", "goodbye", "au revoir"}:
+        state["check_continue"] = False
+    
+    return  state | {"messages": [("user", user_input)]}
+
+# def maybe_route_to_tools(state: FrenchJournalState) -> Literal["tools", "human"]:
+#     """Route between human or tool nodes, depending if a tool call is made."""
+#     if not (msgs := state.get("messages", [])):
+#         raise ValueError(f"No messages in state: {state}")
+
+#     # Only route based on the last message
+#     last_msg = state["messages"][-1]
+
+#     # When the chatbot returns tool_calls, route to the "tools" node.
+#     if hasattr(last_msg, "tool_calls") and len(last_msg.tool_calls) > 0:
+#         return "tools"
+#     else:
+#         return "human"
+
+def maybe_exit_human(state: FrenchJournalState) -> Literal["chatbot", END]:
     """Check if the user wants to continue journaling."""
-    return state["check_continue", True]
+    if state["completed"]:
+        return END
+    else:
+        return "chatbot"
+
 
 # Build graph
 builder = StateGraph(FrenchJournalState)
 
 # Add nodes
-builder.add_node("assistant", assistant)
-builder.add_node("tools", ToolNode(tools))
-builder.add_node("should_continue", should_continue)
+builder.add_node("chatbot", chatbot_with_tools_node)
+# builder.add_node("human", human_node)
+builder.add_node("tools", ToolNode(tools, messages_key="messages"))
 
 # Add edges
-builder.add_edge(START, "assistant")
-builder.add_edge("assistant", "tools")
-builder.add_edge("tools", "assistant")
-builder.add_edge("assistant", "should_continue")
-builder.add_conditional_edges(
-    "should_continue",
-    continue_condition,
-    {
-        True: "assistant",  # Continue conversation
-        False: END         # End the conversation
-    }
-)
+builder.add_edge(START, "chatbot")
+
+builder.add_conditional_edges("chatbot", tools_condition)
+
+# Human may go back to chatbot or exit
+# builder.add_conditional_edges("human", maybe_exit_human)
+
+# Tools always route back to the chat
+builder.add_edge("tools", "chatbot")
+
+
 
 # Compile graph
-graph = builder.compile()
+memory = MemorySaver()
+graph = builder.compile(checkpointer=memory)
